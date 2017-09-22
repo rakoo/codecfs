@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/net/context"
@@ -16,6 +18,7 @@ import (
 )
 
 var allSizes sync.Map
+var allFiles sync.Map
 
 func main() {
 	if len(os.Args) != 2 {
@@ -128,16 +131,69 @@ func (d *dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		case ent.Mode().IsRegular():
 			typ = fuse.DT_File
 		}
+
+		name := ent.Name()
+		if typ == fuse.DT_File && isAudio(filepath.Join(d.dir, ent.Name())) {
+			ext := filepath.Ext(name)
+			name = strings.Replace(name, ext, ".ogg", 1)
+
+			allFiles.Store(filepath.Join(d.dir, name), filepath.Join(d.dir, ent.Name()))
+		}
 		out = append(out, fuse.Dirent{
 			Type: typ,
-			Name: ent.Name(),
+			Name: name,
 		})
 	}
 	return out, nil
 }
 
+func isAudio(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	var buf [512]byte
+	_, err = io.ReadFull(file, buf[:])
+	if err != nil && err != io.EOF {
+		return false
+	}
+
+	// From spec (https://mimesniff.spec.whatwg.org/):
+	//
+	// ```
+	// An audio or video type
+	// is any parsable MIME type where type is equal to "audio" or "video"
+	// or where the MIME type portion is equal to one of the following:
+	//
+	//     application/ogg
+	// ```
+	//
+	// As an addendum, files ending with a .flac will be considered valid
+	// audio
+	contentType := http.DetectContentType(buf[:])
+	if strings.HasPrefix(contentType, "audio/") ||
+		strings.HasPrefix(contentType, "video/") ||
+		contentType == "application/ogg" ||
+		strings.HasSuffix(path, ".flac") {
+		return true
+	}
+	return false
+}
+
 func (d *dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
-	ford, err := os.Open(filepath.Join(d.dir, name))
+	// Note: This works if the user explores files and we do a conversion
+	// of name. If the user directly goes to a specific file without any
+	// other interaction before, then we don't know what files to map back
+	// to.
+	baseName, ok := allFiles.Load(filepath.Join(d.dir, name))
+	log.Println(baseName, ok)
+	if !ok {
+		baseName = filepath.Join(d.dir, name)
+	}
+	baseNameString := baseName.(string)
+
+	ford, err := os.Open(baseNameString)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fuse.ENOENT
@@ -151,12 +207,12 @@ func (d *dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	switch {
 	case stat.Mode().IsDir():
 		return &dir{
-			dir:     filepath.Join(d.dir, name),
+			dir:     baseNameString,
 			encoder: d.encoder,
 		}, nil
 	case stat.Mode().IsRegular():
 		return &file{
-			name:    filepath.Join(d.dir, name),
+			name:    baseNameString,
 			encoder: d.encoder,
 		}, nil
 	}
