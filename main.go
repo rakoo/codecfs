@@ -136,8 +136,9 @@ func (d *dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		if typ == fuse.DT_File && isAudio(filepath.Join(d.dir, ent.Name())) {
 			ext := filepath.Ext(name)
 			name = strings.Replace(name, ext, ".ogg", 1)
-
-			allFiles.Store(filepath.Join(d.dir, name), filepath.Join(d.dir, ent.Name()))
+			if _, err := os.Stat(filepath.Join(d.dir, name)); os.IsNotExist(err) {
+				allFiles.Store(filepath.Join(d.dir, name), filepath.Join(d.dir, ent.Name()))
+			}
 		}
 		out = append(out, fuse.Dirent{
 			Type: typ,
@@ -182,17 +183,17 @@ func isAudio(path string) bool {
 }
 
 func (d *dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
-	// Note: This works if the user explores files and we do a conversion
-	// of name. If the user directly goes to a specific file without any
-	// other interaction before, then we don't know what files to map back
-	// to.
-	baseName, ok := allFiles.Load(filepath.Join(d.dir, name))
-	log.Println(baseName, ok)
-	if !ok {
-		baseName = filepath.Join(d.dir, name)
+	baseNameString := filepath.Join(d.dir, name)
+	if _, err := os.Stat(baseNameString); os.IsNotExist(err) {
+		// Note: This works if the user explores files and we do a conversion
+		// of name. If the user directly goes to a specific file without any
+		// other interaction before, then we don't know what files to map back
+		// to.
+		baseName, ok := allFiles.Load(baseNameString)
+		if ok {
+			baseNameString = baseName.(string)
+		}
 	}
-	baseNameString := baseName.(string)
-
 	ford, err := os.Open(baseNameString)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -229,23 +230,44 @@ type file struct {
 func (f *file) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Mode = 0555
 
+	// Get from cache
 	realSize, ok := allSizes.Load(f.name)
 	if ok {
 		a.Size = realSize.(uint64)
-	} else {
-		// We lie about the size. In a typical usecase we do lossy encodes, so
-		// the output size should be smaller than the input size. By making
-		// the fake size bigger, we should make everyone happy.
-		stat, err := os.Stat(f.name)
-		if err != nil {
-			return err
+		return nil
+	}
+
+	// Get from original file, if it exists as-is
+	stat, err := os.Stat(f.name)
+	if err == nil {
+		a.Size = uint64(stat.Size())
+		return nil
+	}
+
+	// Make up encoded cache size
+	if os.IsNotExist(err) {
+		baseName, ok := allFiles.Load(f.name)
+		if ok {
+			stat, err = os.Stat(baseName.(string))
+			if err != nil {
+				return err
+			}
+
+			// We lie about the size. In a typical usecase we do lossy encodes, so
+			// the output size should be smaller than the input size. By making
+			// the fake size bigger, we should make everyone happy.
+			a.Size = 10 * uint64(stat.Size())
+
 		}
-		a.Size = uint64(10 * stat.Size())
 	}
 	return nil
 }
 
 func (f *file) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+	if file, err := os.Open(f.name); err == nil {
+		return nativeFile{file}, nil
+	}
+
 	cmdArgs := []string{
 		"-i",
 		f.name,
@@ -319,4 +341,25 @@ func (fh *fileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fus
 		return io.EOF
 	}
 	return nil
+}
+
+type nativeFile struct {
+	*os.File
+}
+
+var _ fs.HandleReader = nativeFile{}
+var _ fs.HandleReleaser = nativeFile{}
+
+func (f nativeFile) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+	resp.Data = make([]byte, req.Size)
+	n, err := f.ReadAt(resp.Data, req.Offset)
+	resp.Data = resp.Data[:n]
+	if err == io.EOF {
+		err = nil
+	}
+	return err
+}
+
+func (f nativeFile) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
+	return f.Close()
 }
